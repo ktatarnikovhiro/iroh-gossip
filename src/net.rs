@@ -8,6 +8,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use crate::metrics::Labels;
 use anyhow::Context as _;
 use bytes::BytesMut;
 use futures_concurrency::stream::{stream_group, StreamGroup};
@@ -17,7 +18,7 @@ use iroh::{
     protocol::ProtocolHandler,
     Endpoint, NodeAddr, NodeId, PublicKey, RelayUrl,
 };
-use iroh_metrics::inc;
+use iroh_metrics::{core::Metric, inc};
 use n0_future::{
     boxed::BoxFuture,
     task::{self, AbortOnDropHandle, JoinSet},
@@ -33,7 +34,7 @@ use tracing::{debug, error, error_span, trace, warn, Instrument};
 
 use self::util::{read_message, write_message, Timers};
 use crate::{
-    metrics::Metrics,
+    metrics::{Metrics, PeerMetrics},
     proto::{self, HyparviewConfig, PeerData, PlumtreeConfig, Scope, TopicId},
 };
 
@@ -175,6 +176,13 @@ impl Builder {
     /// By default this is `4096` bytes.
     pub fn max_message_size(mut self, size: usize) -> Self {
         self.config.max_message_size = size;
+        self
+    }
+
+    /// Sets the maximum pending message queue size for a peer.
+    /// By default this is `500` messages.
+    pub fn max_max_peer_pending_queue_size(mut self, size: usize) -> Self {
+        self.config.max_peer_pending_queue_size = size;
         self
     }
 
@@ -478,6 +486,8 @@ struct Actor {
     quit_queue: VecDeque<TopicId>,
     /// Tasks for the connection loops, to keep track of panics.
     connection_tasks: JoinSet<(NodeId, Connection, anyhow::Result<()>)>,
+    /// Max outgoing queue size for a peer
+    max_peer_pending_queue_size: usize,
 }
 
 impl Actor {
@@ -486,6 +496,7 @@ impl Actor {
         config: proto::Config,
         my_addr: &AddrInfo,
     ) -> (Self, mpsc::Sender<ToActor>) {
+        let max_outgoing_queue_size = config.max_peer_pending_queue_size;
         let peer_id = endpoint.node_id();
         let dialer = Dialer::new(endpoint.clone());
         let state = proto::State::new(
@@ -510,6 +521,7 @@ impl Actor {
             topics: Default::default(),
             quit_queue: Default::default(),
             connection_tasks: Default::default(),
+            max_peer_pending_queue_size: max_outgoing_queue_size,
         };
 
         (actor, to_actor_tx)
@@ -700,7 +712,7 @@ impl Actor {
                     active_conn_id: conn_id,
                     other_conns: Vec::new(),
                 });
-                Vec::new()
+                VecDeque::new()
             }
         };
 
@@ -858,7 +870,18 @@ impl Actor {
                                 debug!(peer = %peer_id.fmt_short(), "start to dial");
                                 self.dialer.queue_dial(peer_id, GOSSIP_ALPN);
                             }
-                            queue.push(message);
+                            queue.push_back(message);
+                            while queue.len() > self.max_peer_pending_queue_size {
+                                queue.pop_front();
+                            }
+                            PeerMetrics::with_metric(|m| {
+                                m.queue_size.set(
+                                    &Labels {
+                                        peer_id: peer_id.fmt_short(),
+                                    },
+                                    queue.len() as i64,
+                                )
+                            });
                         }
                     }
                 }
@@ -945,7 +968,7 @@ type ConnId = usize;
 #[derive(Debug)]
 enum PeerState {
     Pending {
-        queue: Vec<ProtoMessage>,
+        queue: VecDeque<ProtoMessage>,
     },
     Active {
         active_send_tx: mpsc::Sender<ProtoMessage>,
@@ -959,7 +982,7 @@ impl PeerState {
         &mut self,
         send_tx: mpsc::Sender<ProtoMessage>,
         conn_id: ConnId,
-    ) -> Vec<ProtoMessage> {
+    ) -> VecDeque<ProtoMessage> {
         match self {
             PeerState::Pending { queue } => {
                 let queue = std::mem::take(queue);
@@ -983,7 +1006,7 @@ impl PeerState {
                 other_conns.push(*active_conn_id);
                 *active_send_tx = send_tx;
                 *active_conn_id = conn_id;
-                Vec::new()
+                VecDeque::new()
             }
         }
     }
@@ -991,7 +1014,9 @@ impl PeerState {
 
 impl Default for PeerState {
     fn default() -> Self {
-        PeerState::Pending { queue: Vec::new() }
+        PeerState::Pending {
+            queue: VecDeque::new(),
+        }
     }
 }
 
@@ -1038,7 +1063,7 @@ async fn connection_loop(
     mut send_rx: mpsc::Receiver<ProtoMessage>,
     in_event_tx: &mpsc::Sender<InEvent>,
     max_message_size: usize,
-    queue: Vec<ProtoMessage>,
+    queue: VecDeque<ProtoMessage>,
 ) -> anyhow::Result<()> {
     let (mut send, mut recv) = match origin {
         ConnOrigin::Accept => conn.accept_bi().await?,
@@ -1049,8 +1074,13 @@ async fn connection_loop(
     let mut recv_buf = BytesMut::new();
 
     let send_loop = async {
+        let peer_id_short = from.fmt_short();
+        let labels = Labels {
+            peer_id: peer_id_short.clone(),
+        };
         for msg in queue {
             write_message(&mut send, &mut send_buf, &msg, max_message_size).await?;
+            PeerMetrics::with_metric(|m| m.queue_size.dec(&labels));
         }
         while let Some(msg) = send_rx.recv().await {
             write_message(&mut send, &mut send_buf, &msg, max_message_size).await?;
